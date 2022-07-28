@@ -17,13 +17,14 @@ const (
 type TimeWheel interface {
 	Start()
 	Stop()
-	AddTask(period time.Duration, key interface{}, job Job, times int64, jitter bool) error
-	RemoveTask(key interface{}) error
+	After(job Job, after time.Duration) (interface{}, error)
+	Add(job Job, options ...TaskOption) (interface{}, error)
+	Remove(key interface{}) error
 }
 
 type Job func()
 
-type wheel struct {
+type timewheel struct {
 	opt        *Options
 	ticker     *time.Ticker
 	slots      []*list.List
@@ -34,7 +35,7 @@ type wheel struct {
 	lock       sync.RWMutex
 }
 
-// New create an empty time wheel
+// New create an empty time timewheel
 func New(opt *Options) TimeWheel {
 	if opt == nil {
 		opt = DefaultOptions
@@ -43,7 +44,7 @@ func New(opt *Options) TimeWheel {
 		return nil
 	}
 
-	tw := &wheel{
+	tw := &timewheel{
 		opt:        opt,
 		slots:      make([]*list.List, opt.slotNum),
 		jobs:       make([]int64, opt.slotNum),
@@ -57,13 +58,13 @@ func New(opt *Options) TimeWheel {
 	return tw
 }
 
-// Start  the time wheel
-func (tw *wheel) Start() {
+// Start  the time timewheel
+func (tw *timewheel) Start() {
 	tw.ticker = time.NewTicker(tw.opt.precision)
 	go tw.start()
 }
 
-func (tw *wheel) start() {
+func (tw *timewheel) start() {
 	for {
 		select {
 		case <-tw.ticker.C:
@@ -75,60 +76,65 @@ func (tw *wheel) start() {
 	}
 }
 
-// AddTask add new task to the time wheel
-func (tw *wheel) AddTask(period time.Duration, key interface{}, job Job, times int64, jitter bool) error {
-	if period <= 0 || key == "" || job == nil || times < TimesForever || times == TimesStop {
-		return errors.New("illegal task params")
+func (tw *timewheel) After(job Job, after time.Duration) (interface{}, error) {
+	return tw.Add(job, WithPeriod(after))
+}
+
+// Add new task to the time wheel
+func (tw *timewheel) Add(job Job, options ...TaskOption) (interface{}, error) {
+	opts := defaultTaskOpts()
+	for _, option := range options {
+		option(opts)
 	}
 
-	// if task period less than time wheel precision,
-	// we will ignore this task or let the task interval equal the time wheel precision.
+	// if task period less than time timewheel precision,
+	// we will ignore this task or let the task interval equal the time timewheel precision.
 	// the threshold is PrecisionThreshold
-	if tw.opt.precision > period {
-		if int64(tw.opt.precision/period) < PrecisionThreshold {
-			period = tw.opt.precision
+	if tw.opt.precision > opts.Period {
+		if int64(tw.opt.precision/opts.Period) < PrecisionThreshold {
+			opts.Period = tw.opt.precision
 		} else {
-			return errors.New("the task period is much smaller than the time wheel precision")
+			return nil, errors.New("the task period is much smaller than the time timewheel precision")
 		}
 	}
 
 	tw.lock.Lock()
 	defer tw.lock.Unlock()
-	_, ok := tw.taskRecord[key]
+	_, ok := tw.taskRecord[opts.Key]
 
 	if ok {
-		return errors.New("duplicate task key")
+		return nil, errors.New("duplicate task key")
 	}
 
 	// 60/2/60=0
 	// 60/1/60=1
 	// 90/1/60=1
-	cycle := int64(period/tw.opt.precision) / tw.opt.slotNum
+	cycle := int64(opts.Period/tw.opt.precision) / tw.opt.slotNum
 	// 60/2%60=30
 	// 60/1%60=0
 	// 90/1%60=30
-	_period := int64(period/tw.opt.precision) % tw.opt.slotNum
+	_period := int64(opts.Period/tw.opt.precision) % tw.opt.slotNum
 
 	_task := &task{
-		key:    key,
+		key:    opts.Key,
 		period: _period,
-		times:  times,
+		times:  opts.Times,
 		cycle:  cycle,
 		start:  tw.currentPos,
 		pos:    tw.currentPos,
-		jitter: jitter,
+		jitter: opts.Jitter,
 		job:    job,
 	}
-	tw.taskRecord[key] = _task
+	tw.taskRecord[opts.Key] = _task
 
 	pos := _task.next(tw.opt.slotNum, tw.jobs)
 	tw.slots[pos].PushBack(_task)
 	tw.jobs[pos] = int64(tw.slots[pos].Len())
-	return nil
+	return opts.Key, nil
 }
 
-// RemoveTask remove the task from time wheel
-func (tw *wheel) RemoveTask(key interface{}) error {
+// Remove the task from time wheel
+func (tw *timewheel) Remove(key interface{}) error {
 	if key == "" {
 		return nil
 	}
@@ -146,8 +152,8 @@ func (tw *wheel) RemoveTask(key interface{}) error {
 	return nil
 }
 
-// time wheel initialize
-func (tw *wheel) init() {
+// time timewheel initialize
+func (tw *timewheel) init() {
 	for i := 0; i < int(tw.opt.slotNum); i++ {
 		tw.slots[i] = list.New()
 		tw.jobs[i] = 0
@@ -155,7 +161,7 @@ func (tw *wheel) init() {
 }
 
 //
-func (tw *wheel) tickHandler() {
+func (tw *timewheel) tickHandler() {
 	l := tw.slots[tw.currentPos]
 	tw.scanAndRun(l, tw.currentPos)
 
@@ -167,7 +173,7 @@ func (tw *wheel) tickHandler() {
 }
 
 // scan task list and run the task
-func (tw *wheel) scanAndRun(l *list.List, currentPos int64) {
+func (tw *timewheel) scanAndRun(l *list.List, currentPos int64) {
 
 	if l == nil || l.Len() == 0 {
 		return
@@ -212,14 +218,14 @@ func (tw *wheel) scanAndRun(l *list.List, currentPos int64) {
 
 }
 
-// Stop  the time wheel
-func (tw *wheel) Stop() {
+// Stop  the time timewheel
+func (tw *timewheel) Stop() {
 	tw.stopCh <- struct{}{}
 }
 
 type task struct {
 	key interface{}
-	//period The time period that needs to be traveled on the time wheel each time the task is executed
+	//period The time period that needs to be traveled on the time timewheel each time the task is executed
 	period int64
 	// run times
 	times int64 //-1:no limit >=1:run times
@@ -237,7 +243,7 @@ type task struct {
 	job    Job
 }
 
-//Next 计算下一次执行的时间
+//calculate next run time
 func (t *task) next(slotNum int64, jobs []int64) int64 {
 	t.runCycle = 0
 
